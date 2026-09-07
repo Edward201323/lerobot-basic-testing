@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import math
 from pathlib import Path
 import sys
 import types
@@ -70,6 +71,7 @@ class FakeBus:
 class HoldingTests(unittest.TestCase):
     def run_wave(self, bus, dry=False, interrupt=False):
         def offsets(*args):
+            self.motion_parameters = args
             if not dry:
                 self.assertEqual(bus.enabled, set(wave.MOTORS))
             yield 10
@@ -133,11 +135,35 @@ class HoldingTests(unittest.TestCase):
         self.run_wave(bus, interrupt=True)
         self.assert_clean(bus)
 
+    def test_default_motion_is_continuous_with_requested_amplitude_and_period(self):
+        bus = FakeBus()
+        self.run_wave(bus, interrupt=True)
+        self.assertEqual(self.motion_parameters, (math.inf, 35 * wave.STEPS_PER_DEG, 1.5))
+        self.assert_clean(bus)
+
     def test_dry_run_never_writes_or_changes_torque(self):
         bus = FakeBus()
         self.run_wave(bus, dry=True)
         self.assertEqual(bus.events, [])
         self.assertFalse(bus.disconnected_with)
+
+
+class WaveTimingTests(unittest.TestCase):
+    def test_continuous_motion_keeps_generating_until_interrupted(self):
+        with patch.object(wave.time, "perf_counter", side_effect=[0, 0.375, 3600.375, KeyboardInterrupt]), \
+             patch.object(wave.time, "sleep"):
+            offsets = wave.wave_offsets(math.inf, 100, 1.5)
+            self.assertAlmostEqual(next(offsets), 100)
+            self.assertAlmostEqual(next(offsets), 100)
+            with self.assertRaises(KeyboardInterrupt):
+                next(offsets)
+
+    def test_finite_motion_still_finishes_at_rest(self):
+        with patch.object(wave.time, "perf_counter", side_effect=[0, 0.375, 1.5]), \
+             patch.object(wave.time, "sleep"):
+            offsets = list(wave.wave_offsets(1, 100, 1.5))
+            self.assertAlmostEqual(offsets[0], 100)
+            self.assertEqual(offsets[-1], 0)
 
 
 if __name__ == "__main__":

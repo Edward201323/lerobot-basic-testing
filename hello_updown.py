@@ -11,7 +11,8 @@ so this script temporarily widens that limit to fit the swing and restores the
 original values on the way out. The widening happens while the joint is still
 limp -- energizing first would snap the wrist to the nearest limit.
 
-    python hello_updown.py                # 3 waves, +/-15 deg
+    python hello_updown.py                # continuous waves, +/-35 deg, 1.5s period
+    python hello_updown.py --waves 3      # stop after 3 waves
     python hello_updown.py --dry-run      # print the motion, command nothing
 """
 
@@ -54,7 +55,7 @@ def wave_offsets(waves, amplitude_steps, period):
     """Yield step offsets from center tracing `waves` up-and-down flexes.
 
     The offset follows a sine so the wrist eases through each turnaround
-    instead of slamming into it.
+    instead of slamming into it. `waves=math.inf` runs until interrupted.
     """
     duration = waves * period
     start = time.perf_counter()
@@ -131,13 +132,14 @@ def _safely(step, *args, **kwargs):
 def main():
     parser = argparse.ArgumentParser(description="Wave hello by flexing the wrist up and down.")
     parser.add_argument("--port", default=None, help="serial port (default: autodetect)")
-    parser.add_argument("--waves", type=float, default=3, help="up-and-down flexes (default: 3)")
-    parser.add_argument("--amplitude", type=float, default=15.0, help="degrees each way (default: 15)")
-    parser.add_argument("--period", type=float, default=1.0, help="seconds per full flex (default: 1.0)")
+    parser.add_argument("--waves", type=float, default=math.inf,
+                        help="up-and-down flexes; inf runs until Ctrl+C (default: inf)")
+    parser.add_argument("--amplitude", type=float, default=35.0, help="degrees each way (default: 35)")
+    parser.add_argument("--period", type=float, default=1.5, help="seconds per full flex (default: 1.5)")
     parser.add_argument("--dry-run", action="store_true", help="show the motion without commanding the arm")
     args = parser.parse_args()
-    if not all(math.isfinite(value) for value in (args.waves, args.amplitude, args.period)):
-        parser.error("waves, amplitude, and period must be finite")
+    if math.isnan(args.waves) or not all(math.isfinite(value) for value in (args.amplitude, args.period)):
+        parser.error("waves must be a number or inf; amplitude and period must be finite")
     if args.waves < 0 or args.amplitude < 0 or args.period <= 0:
         parser.error("waves and amplitude must be nonnegative; period must be positive")
 
@@ -174,6 +176,8 @@ def main():
             f"{joint}={position}" for joint, position in rest_positions.items()
         ))
         print("hello!")
+        if math.isinf(args.waves):
+            print("waving continuously; press Ctrl+C to return to rest and release")
 
         if not args.dry_run:
             for joint, position in rest_positions.items():
