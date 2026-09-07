@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Wave hello by flexing the SO-arm's wrist up and down.
 
-Moves wrist_flex (id 4). Every other joint holds its starting position with
-torque enabled during the wave. All joints are released on exit.
+The pose measured at startup becomes this run's rest pose. Moves wrist_flex
+(id 4) relative to its rest angle while every other joint holds its rest
+position. Returns to the captured rest pose, then releases all joints on exit.
 
 wrist_flex ships with a degenerate firmware limit on this arm
 (Min_Position_Limit == Max_Position_Limit == 2046, i.e. zero allowed travel),
@@ -76,9 +77,11 @@ def render(degrees, amplitude_deg, width=31):
 
 
 
-def _park(bus, center):
-    """Best effort: send the wrist back where it started."""
-    bus.write("Goal_Position", JOINT, center, normalize=False, num_retry=WRITE_RETRIES)
+def _park(bus, rest_positions):
+    """Best effort: return every joint to this run's captured rest pose."""
+    for joint, position in rest_positions.items():
+        _safely(bus.write, "Goal_Position", joint, position,
+                normalize=False, num_retry=WRITE_RETRIES)
     time.sleep(0.4)  # let it coast home before going limp
 
 
@@ -146,13 +149,15 @@ def main():
     saved_limits = {}
     wrist_enabled = False
     try:
-        positions = {
+        # Capture once per run, before sending any commands. No fixed home
+        # angle or saved pose overrides the position the user starts from.
+        rest_positions = {
             joint: bus.read("Present_Position", joint, normalize=False)
             for joint in MOTORS
         }
-        if any(not POS_MIN <= position <= POS_MAX for position in positions.values()):
+        if any(not POS_MIN <= position <= POS_MAX for position in rest_positions.values()):
             raise ValueError("A joint position is outside the single-turn encoder range")
-        center = positions[JOINT]
+        center = rest_positions[JOINT]
 
         # Keep the swing inside the encoder's range, wherever the wrist rests.
         amplitude = min(
@@ -165,10 +170,13 @@ def main():
         amplitude_steps = amplitude * STEPS_PER_DEG
 
         print(f"port {port} | {JOINT} at {center} | flexing +/-{amplitude:.0f} deg")
+        print("rest pose (encoder steps): " + ", ".join(
+            f"{joint}={position}" for joint, position in rest_positions.items()
+        ))
         print("hello!")
 
         if not args.dry_run:
-            for joint, position in positions.items():
+            for joint, position in rest_positions.items():
                 lo = bus.read("Min_Position_Limit", joint, normalize=False)
                 hi = bus.read("Max_Position_Limit", joint, normalize=False)
                 swing = amplitude_steps if joint == JOINT else 0
@@ -218,7 +226,7 @@ def main():
         if not args.dry_run and bus.is_connected:
             # Each step is independent: a failure in one must not skip the rest.
             if wrist_enabled:
-                _safely(_park, bus, center)
+                _safely(_park, bus, rest_positions)
             _safely(_release, bus)
             for joint, limits in saved_limits.items():
                 _safely(_restore_limits, bus, joint, limits)

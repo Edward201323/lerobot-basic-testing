@@ -95,11 +95,32 @@ class HoldingTests(unittest.TestCase):
         for joint, position in bus.positions.items():
             goals = [e[2] for e in bus.events if e[:2] == ("Goal_Position", joint)]
             if joint != wave.JOINT:
-                self.assertEqual(goals, [position])
+                self.assertEqual(goals, [position, position])
             else:
                 self.assertIn(position + 10, goals)
                 self.assertEqual(goals[-1], position)
         self.assert_clean(bus)
+
+    def test_each_run_adopts_its_starting_pose_despite_stale_goals(self):
+        bus = FakeBus()
+        for base in (900, 2800):
+            with self.subTest(base=base):
+                bus.positions = {joint: base + index * 20
+                                 for index, joint in enumerate(wave.MOTORS)}
+                # The second run retains goals from the previous run until
+                # main replaces them with newly measured positions.
+                bus.events.clear()
+                self.run_wave(bus)
+                for joint, position in bus.positions.items():
+                    goals = [e[2] for e in bus.events
+                             if e[:2] == ("Goal_Position", joint)]
+                    self.assertEqual(goals[0], position)
+                    self.assertEqual(goals[-1], position)
+                    if joint == wave.JOINT:
+                        self.assertIn(position + 10, goals)
+                    else:
+                        self.assertTrue(all(goal == position for goal in goals))
+                self.assert_clean(bus)
 
     def test_partial_enable_failure_releases_and_restores_all(self):
         bus = FakeBus(fail_enable="elbow_flex")

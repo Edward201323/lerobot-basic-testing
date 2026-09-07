@@ -9,8 +9,12 @@ python hello_updown.py --waves 3 --amplitude 15 --period 1
 ```
 
 `hello_updown.py` moves `wrist_flex` while the other five servos hold their
-positions captured at startup. It returns the wrist to its starting position
-and releases all servos on exit, including after Ctrl+C. Support the arm when
+positions captured at startup. Whatever pose you start the program in becomes
+the rest pose for that run: the wrist waves around its captured angle, and all
+joints are commanded back to that pose before release, including after Ctrl+C.
+Each new run captures a fresh rest pose; it does not change calibration or save
+a permanent home position. The captured encoder values are printed at startup.
+Support the arm when
 it releases. Any firmware position limits temporarily widened for the motion
 or holding positions are restored during cleanup.
 
