@@ -2,8 +2,9 @@
 """Wave hello by flexing the SO-arm's wrist up and down.
 
 The pose measured at startup becomes this run's rest pose. Moves wrist_flex
-(id 4) relative to its rest angle while every other joint holds its rest
-position. Returns to the captured rest pose, then releases all joints on exit.
+(id 4) relative to its rest angle and gently opens/closes the gripper in sync.
+The remaining joints hold their rest positions. Returns to the captured rest
+pose, then releases all joints on exit.
 
 wrist_flex ships with a degenerate firmware limit on this arm
 (Min_Position_Limit == Max_Position_Limit == 2046, i.e. zero allowed travel),
@@ -27,6 +28,7 @@ from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 
 JOINT = "wrist_flex"
+GRIPPER = "gripper"
 STEPS_PER_DEG = 4096 / 360  # STS3215: 4096 encoder steps per full turn
 POS_MIN, POS_MAX = 0, 4095
 FRAME_RATE = 50.0  # position commands per second
@@ -166,15 +168,18 @@ def main():
     parser.add_argument("--waves", type=float, default=math.inf,
                         help="up-and-down flexes; inf runs until Ctrl+C (default: inf)")
     parser.add_argument("--amplitude", type=float, default=35.0, help="degrees each way (default: 35)")
+    parser.add_argument("--grip-amplitude", type=float, default=3.0,
+                        help="gripper servo degrees each way, within firmware limits; 0 holds still (default: 3)")
     parser.add_argument("--period", type=float, default=1.5, help="seconds per full flex (default: 1.5)")
     parser.add_argument("--dry-run", action="store_true", help="show the motion without commanding the arm")
     parser.add_argument("--diagnostics", action="store_true",
                         help="report elbow telemetry every second; stop on a fault, torque loss, or read failure")
     args = parser.parse_args()
-    if math.isnan(args.waves) or not all(math.isfinite(value) for value in (args.amplitude, args.period)):
-        parser.error("waves must be a number or inf; amplitude and period must be finite")
-    if args.waves < 0 or args.amplitude < 0 or args.period <= 0:
-        parser.error("waves and amplitude must be nonnegative; period must be positive")
+    if math.isnan(args.waves) or not all(math.isfinite(value) for value in
+                                       (args.amplitude, args.grip_amplitude, args.period)):
+        parser.error("waves must be a number or inf; amplitudes and period must be finite")
+    if args.waves < 0 or args.amplitude < 0 or args.grip_amplitude < 0 or args.period <= 0:
+        parser.error("waves and amplitudes must be nonnegative; period must be positive")
 
     port = args.port or find_port()
     bus = FeetechMotorsBus(port, MOTORS)
@@ -204,8 +209,23 @@ def main():
         if amplitude < args.amplitude:
             print(f"note: wrist rests near a limit, trimming swing to +/-{amplitude:.0f} deg")
         amplitude_steps = amplitude * STEPS_PER_DEG
+        grip_center = rest_positions[GRIPPER]
+        grip_limits = (
+            bus.read("Min_Position_Limit", GRIPPER, normalize=False),
+            bus.read("Max_Position_Limit", GRIPPER, normalize=False),
+        )
+        # Use raw servo angles, not normalized opening percentages. Respect
+        # the gripper's existing travel limits when adding motion.
+        grip_steps = min(
+            args.grip_amplitude * STEPS_PER_DEG,
+            max(0, grip_center - max(POS_MIN, grip_limits[0])),
+            max(0, min(POS_MAX, grip_limits[1]) - grip_center),
+        ) if amplitude_steps else 0
+        if grip_steps < args.grip_amplitude * STEPS_PER_DEG:
+            print("note: trimming gripper motion to fit its limits and wrist motion")
 
         print(f"port {port} | {JOINT} at {center} | flexing +/-{amplitude:.0f} deg")
+        print(f"gripper at {grip_center} | opening/closing +/-{grip_steps / STEPS_PER_DEG:.1f} servo deg")
         print("rest pose (encoder steps): " + ", ".join(
             f"{joint}={position}" for joint, position in rest_positions.items()
         ))
@@ -215,8 +235,11 @@ def main():
 
         if not args.dry_run:
             for joint, position in rest_positions.items():
-                lo = bus.read("Min_Position_Limit", joint, normalize=False)
-                hi = bus.read("Max_Position_Limit", joint, normalize=False)
+                if joint == GRIPPER:
+                    lo, hi = grip_limits
+                else:
+                    lo = bus.read("Min_Position_Limit", joint, normalize=False)
+                    hi = bus.read("Max_Position_Limit", joint, normalize=False)
                 swing = amplitude_steps if joint == JOINT else 0
                 need_lo = max(POS_MIN, round(position - swing) - MARGIN)
                 need_hi = min(POS_MAX, round(position + swing) + MARGIN)
@@ -234,17 +257,18 @@ def main():
                 bus.write("Goal_Position", joint, position, normalize=False, num_retry=WRITE_RETRIES)
 
             # Each stationary servo maintains its goal internally while the
-            # wrist receives changing goals. Energize the wrist last.
+            # wrist and gripper receive changing goals. Energize the wrist last.
             for joint in MOTORS:
                 if joint != JOINT:
                     bus.enable_torque(joint, num_retry=WRITE_RETRIES)
             bus.enable_torque(JOINT, num_retry=WRITE_RETRIES)
             wrist_enabled = True
-            print("other joints holding their starting positions")
+            print("shoulder, elbow, and wrist roll holding their starting positions")
 
         drops = 0
         next_diagnostic = 0.0
         for offset in wave_offsets(args.waves, amplitude_steps, args.period):
+            grip_offset = offset / amplitude_steps * grip_steps if amplitude_steps else 0
             if not args.dry_run:
                 if args.diagnostics and time.monotonic() >= next_diagnostic:
                     if not _check_elbow(bus, rest_positions["elbow_flex"]):
@@ -254,6 +278,9 @@ def main():
                 try:
                     bus.write("Goal_Position", JOINT, round(center + offset),
                               normalize=False, num_retry=WRITE_RETRIES)
+                    if grip_steps:
+                        bus.write("Goal_Position", GRIPPER, round(grip_center + grip_offset),
+                                  normalize=False, num_retry=WRITE_RETRIES)
                     drops = 0
                 except Exception:
                     # One glitched packet should cost a frame, not the wave.
@@ -261,7 +288,8 @@ def main():
                     if drops >= MAX_CONSECUTIVE_DROPS:
                         print("\nbus went quiet, stopping early")
                         break
-            print(render(offset / STEPS_PER_DEG, amplitude), end="\r", flush=True)
+            print(render(offset / STEPS_PER_DEG, amplitude)
+                  + f" | grip {grip_offset / STEPS_PER_DEG:+.1f} servo deg", end="\r", flush=True)
         print()
 
     except KeyboardInterrupt:

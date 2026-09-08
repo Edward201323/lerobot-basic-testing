@@ -30,6 +30,8 @@ class FakeBus:
         self.positions = {joint: 2000 + index * 10 for index, joint in enumerate(wave.MOTORS)}
         # Exercise degenerate limits on stationary and moving joints.
         self.limits = {joint: [2046, 2046] for joint in wave.MOTORS}
+        self.limits[wave.GRIPPER] = [0, 4095]
+        self.original_limits = {joint: list(limits) for joint, limits in self.limits.items()}
         self.goals = {}
         self.enabled = set()
         self.events = []
@@ -77,19 +79,21 @@ class FakeBus:
 
 
 class HoldingTests(unittest.TestCase):
-    def run_wave(self, bus, dry=False, interrupt=False, diagnostics=False):
+    def run_wave(self, bus, dry=False, interrupt=False, diagnostics=False,
+                 extra_args=(), samples=(10, 0)):
         def offsets(*args):
             self.motion_parameters = args
             if not dry:
                 self.assertEqual(bus.enabled, set(wave.MOTORS))
-            yield 10
+            yield samples[0]
             if interrupt:
                 raise KeyboardInterrupt
-            yield 0
+            yield from samples[1:]
 
         argv = ["jerkoff.py", "--port", "fake"] + (["--dry-run"] if dry else [])
         if diagnostics:
             argv.append("--diagnostics")
+        argv.extend(extra_args)
         with patch.object(wave, "FeetechMotorsBus", return_value=bus), \
              patch.object(wave, "wave_offsets", offsets), \
              patch.object(wave.time, "sleep"), patch.object(sys, "argv", argv), \
@@ -99,17 +103,20 @@ class HoldingTests(unittest.TestCase):
     def assert_clean(self, bus):
         self.assertFalse(bus.enabled)
         self.assertFalse(bus.is_connected)
-        self.assertTrue(all(limits == [2046, 2046] for limits in bus.limits.values()))
+        self.assertEqual(bus.limits, bus.original_limits)
 
     def test_other_servos_keep_initial_goals(self):
         bus = FakeBus()
         self.run_wave(bus)
         for joint, position in bus.positions.items():
             goals = [e[2] for e in bus.events if e[:2] == ("Goal_Position", joint)]
-            if joint != wave.JOINT:
+            if joint not in (wave.JOINT, wave.GRIPPER):
                 self.assertEqual(goals, [position, position])
-            else:
+            elif joint == wave.JOINT:
                 self.assertIn(position + 10, goals)
+                self.assertEqual(goals[-1], position)
+            else:
+                self.assertIn(position + 1, goals)
                 self.assertEqual(goals[-1], position)
         self.assert_clean(bus)
 
@@ -130,7 +137,7 @@ class HoldingTests(unittest.TestCase):
                     self.assertEqual(goals[-1], position)
                     if joint == wave.JOINT:
                         self.assertIn(position + 10, goals)
-                    else:
+                    elif joint != wave.GRIPPER:
                         self.assertTrue(all(goal == position for goal in goals))
                 self.assert_clean(bus)
 
@@ -139,6 +146,59 @@ class HoldingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "simulated"):
             self.run_wave(bus)
         self.assert_clean(bus)
+
+    def test_gripper_moves_both_ways_with_wrist_and_returns_to_rest(self):
+        bus = FakeBus()
+        peak = 35 * wave.STEPS_PER_DEG
+        self.run_wave(bus, samples=(peak, -peak, 0))
+        center = bus.positions[wave.GRIPPER]
+        goals = [event[2] for event in bus.events
+                 if event[:2] == ("Goal_Position", wave.GRIPPER)]
+        self.assertEqual(goals, [center, round(center + 3 * wave.STEPS_PER_DEG),
+                                 round(center - 3 * wave.STEPS_PER_DEG), center, center])
+        self.assert_clean(bus)
+
+    def test_gripper_amplitude_is_adjustable(self):
+        bus = FakeBus()
+        self.run_wave(bus, extra_args=("--grip-amplitude", "2"),
+                      samples=(35 * wave.STEPS_PER_DEG, 0))
+        self.assertIn(("Goal_Position", wave.GRIPPER,
+                       round(bus.positions[wave.GRIPPER] + 2 * wave.STEPS_PER_DEG)), bus.events)
+        self.assert_clean(bus)
+
+    def test_zero_grip_or_wrist_amplitude_holds_gripper_still(self):
+        for option in ("--grip-amplitude", "--amplitude"):
+            with self.subTest(option=option):
+                bus = FakeBus()
+                self.run_wave(bus, extra_args=(option, "0"), samples=(0, 0))
+                goals = [event[2] for event in bus.events
+                         if event[:2] == ("Goal_Position", wave.GRIPPER)]
+                self.assertEqual(goals, [bus.positions[wave.GRIPPER]] * 2)
+                self.assert_clean(bus)
+
+    def test_gripper_motion_respects_narrow_or_degenerate_limits(self):
+        for headroom in (5, 0):
+            with self.subTest(headroom=headroom):
+                bus = FakeBus()
+                center = bus.positions[wave.GRIPPER]
+                bus.limits[wave.GRIPPER] = [center - headroom, center + headroom]
+                bus.original_limits[wave.GRIPPER] = list(bus.limits[wave.GRIPPER])
+                peak = 35 * wave.STEPS_PER_DEG
+                self.run_wave(bus, samples=(peak, -peak, 0))
+                goals = [event[2] for event in bus.events
+                         if event[:2] == ("Goal_Position", wave.GRIPPER)]
+                self.assertEqual(min(goals), center - headroom)
+                self.assertEqual(max(goals), center + headroom)
+                self.assert_clean(bus)
+
+    def test_invalid_grip_amplitude_is_rejected_before_connecting(self):
+        for value in ("-1", "nan", "inf"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                bus = FakeBus()
+                with self.assertRaises(SystemExit):
+                    self.run_wave(bus, extra_args=("--grip-amplitude", value))
+                self.assertFalse(bus.is_connected)
+                self.assertEqual(bus.events, [])
 
     def test_interrupt_releases_and_restores_all(self):
         bus = FakeBus()

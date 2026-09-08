@@ -10,11 +10,16 @@ python jerkoff.py --waves 5 --amplitude 20 --period 2
 ```
 
 With no options, the arm waves continuously at ±35° with a 1.5-second period.
+The gripper gently opens and closes in sync, centered on its startup position,
+with a default amplitude of ±3° of gripper servo rotation. Adjust this with
+`--grip-amplitude 2`, or use `--grip-amplitude 0` to keep the gripper still.
+Gripper motion is trimmed to its existing firmware limits; at a limit or with
+zero-width limits it stays still. A zero wrist amplitude also stops gripper motion.
 Press Ctrl+C to stop. Use `--waves N` for a finite number of waves, or
 `--waves inf` to explicitly select continuous motion. The swing is trimmed
 when necessary to stay within the encoder range.
 
-`jerkoff.py` moves `wrist_flex` while the other five servos hold their
+`jerkoff.py` moves `wrist_flex` and `gripper` while the other four servos hold their
 positions captured at startup. Whatever pose you start the program in becomes
 the rest pose for that run: the wrist waves around its captured angle, and all
 joints are commanded back to that pose before release, including after Ctrl+C.
