@@ -15,7 +15,7 @@ motors.MotorNormMode = types.SimpleNamespace(DEGREES=1, RANGE_0_100=2)
 feetech = types.ModuleType("lerobot.motors.feetech")
 feetech.FeetechMotorsBus = object
 spec = importlib.util.spec_from_file_location(
-    "hello_updown", Path(__file__).resolve().parents[1] / "hello_updown.py"
+    "arm_wave", Path(__file__).resolve().parents[1] / "jerkoff.py"
 )
 wave = importlib.util.module_from_spec(spec)
 with patch.dict(sys.modules, {"lerobot": types.ModuleType("lerobot"),
@@ -34,6 +34,8 @@ class FakeBus:
         self.enabled = set()
         self.events = []
         self.fail_enable = fail_enable
+        self.telemetry = {"Status": 0, "Present_Load": 100, "Present_Temperature": 30,
+                          "Present_Voltage": 74, "Present_Current": 50}
 
     def connect(self, handshake=False):
         self.is_connected = True
@@ -41,7 +43,13 @@ class FakeBus:
     def read(self, register, joint, **kwargs):
         if register == "Present_Position":
             return self.positions[joint]
-        return self.limits[joint][register == "Max_Position_Limit"]
+        if register == "Goal_Position":
+            return self.goals[joint]
+        if register == "Torque_Enable":
+            return int(joint in self.enabled)
+        if register in ("Min_Position_Limit", "Max_Position_Limit"):
+            return self.limits[joint][register == "Max_Position_Limit"]
+        return self.telemetry[register]
 
     def write(self, register, joint, value, **kwargs):
         self.events.append((register, joint, value))
@@ -69,7 +77,7 @@ class FakeBus:
 
 
 class HoldingTests(unittest.TestCase):
-    def run_wave(self, bus, dry=False, interrupt=False):
+    def run_wave(self, bus, dry=False, interrupt=False, diagnostics=False):
         def offsets(*args):
             self.motion_parameters = args
             if not dry:
@@ -79,7 +87,9 @@ class HoldingTests(unittest.TestCase):
                 raise KeyboardInterrupt
             yield 0
 
-        argv = ["hello_updown.py", "--port", "fake"] + (["--dry-run"] if dry else [])
+        argv = ["jerkoff.py", "--port", "fake"] + (["--dry-run"] if dry else [])
+        if diagnostics:
+            argv.append("--diagnostics")
         with patch.object(wave, "FeetechMotorsBus", return_value=bus), \
              patch.object(wave, "wave_offsets", offsets), \
              patch.object(wave.time, "sleep"), patch.object(sys, "argv", argv), \
@@ -146,6 +156,65 @@ class HoldingTests(unittest.TestCase):
         self.run_wave(bus, dry=True)
         self.assertEqual(bus.events, [])
         self.assertFalse(bus.disconnected_with)
+
+    def test_diagnostics_allow_healthy_motion(self):
+        bus = FakeBus()
+        self.run_wave(bus, diagnostics=True)
+        self.assert_clean(bus)
+        self.assertIn(("Goal_Position", wave.JOINT, bus.positions[wave.JOINT] + 10), bus.events)
+
+    def test_elbow_fault_stops_without_sending_new_goals(self):
+        bus = FakeBus()
+        bus.telemetry["Status"] = 32
+        self.run_wave(bus, diagnostics=True)
+        self.assert_clean(bus)
+        goals = [event for event in bus.events if event[0] == "Goal_Position"]
+        self.assertEqual(len(goals), len(wave.MOTORS))  # only startup goals
+
+    def test_fault_after_motion_stops_before_next_wrist_command(self):
+        bus = FakeBus()
+        write = bus.write
+
+        def trip_after_motion(register, joint, value, **kwargs):
+            write(register, joint, value, **kwargs)
+            if register == "Goal_Position" and joint == wave.JOINT and value != bus.positions[joint]:
+                bus.telemetry["Status"] = 32
+
+        with patch.object(bus, "write", side_effect=trip_after_motion), \
+             patch.object(wave.time, "monotonic", side_effect=[0, 0, 2]):
+            self.run_wave(bus, diagnostics=True)
+        self.assert_clean(bus)
+        wrist_goals = [event[2] for event in bus.events
+                       if event[:2] == ("Goal_Position", wave.JOINT)]
+        self.assertEqual(wrist_goals, [bus.positions[wave.JOINT], bus.positions[wave.JOINT] + 10])
+
+
+class ElbowDiagnosticTests(unittest.TestCase):
+    def test_torque_loss_is_reported_without_writes(self):
+        bus = FakeBus()
+        bus.goals = dict(bus.positions)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(wave._check_elbow(bus, bus.positions["elbow_flex"]))
+        self.assertIn("Torque_Enable=0", output.getvalue())
+        self.assertEqual(bus.events, [])
+
+    def test_failed_read_preserves_other_telemetry_and_error(self):
+        bus = FakeBus()
+        bus.enabled = set(wave.MOTORS)
+        bus.goals = dict(bus.positions)
+        read = bus.read
+
+        def faulty_read(register, *args, **kwargs):
+            if register == "Status":
+                raise RuntimeError("servo overload response")
+            return read(register, *args, **kwargs)
+
+        with patch.object(bus, "read", side_effect=faulty_read), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(wave._check_elbow(bus, bus.positions["elbow_flex"]))
+        self.assertIn("Present_Temperature=30", output.getvalue())
+        self.assertIn("servo overload response", output.getvalue())
+        self.assertEqual(bus.events, [])
 
 
 class WaveTimingTests(unittest.TestCase):

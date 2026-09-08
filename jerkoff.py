@@ -11,9 +11,10 @@ so this script temporarily widens that limit to fit the swing and restores the
 original values on the way out. The widening happens while the joint is still
 limp -- energizing first would snap the wrist to the nearest limit.
 
-    python hello_updown.py                # continuous waves, +/-35 deg, 1.5s period
-    python hello_updown.py --waves 3      # stop after 3 waves
-    python hello_updown.py --dry-run      # print the motion, command nothing
+    python jerkoff.py                # continuous waves, +/-35 deg, 1.5s period
+    python jerkoff.py --waves 3      # stop after 3 waves
+    python jerkoff.py --dry-run      # print the motion, command nothing
+    python jerkoff.py --diagnostics  # report elbow telemetry once per second
 """
 
 import argparse
@@ -32,6 +33,7 @@ FRAME_RATE = 50.0  # position commands per second
 MARGIN = 40  # extra steps of headroom around the swing, ~3.5 deg
 WRITE_RETRIES = 3  # Feetech buses occasionally return a corrupted status packet
 MAX_CONSECUTIVE_DROPS = 10  # ~0.2s of silence means the bus is really gone
+DIAGNOSTIC_INTERVAL = 1.0  # seconds between elbow telemetry snapshots
 
 MOTORS = {
     "shoulder_pan": Motor(1, "sts3215", MotorNormMode.DEGREES),
@@ -129,6 +131,35 @@ def _safely(step, *args, **kwargs):
         print(f"\nwarning: {step.__name__} failed ({type(e).__name__}: {e})")
 
 
+def _check_elbow(bus, rest_position):
+    """Print raw telemetry; return False on a fault or unreadable feedback.
+
+    Read each field independently so one failed read does not hide the rest.
+    Goal writes can clear protection on these servos, so diagnostics only read.
+    """
+    values = {}
+    errors = []
+    for register in ("Torque_Enable", "Status", "Present_Position", "Goal_Position",
+                     "Present_Load", "Present_Temperature", "Present_Voltage", "Present_Current"):
+        try:
+            values[register] = bus.read(register, "elbow_flex", normalize=False,
+                                        num_retry=WRITE_RETRIES)
+        except Exception as error:
+            errors.append(f"{register}: {type(error).__name__}: {error}")
+    fields = [f"rest={rest_position}"]
+    fields.extend(f"{name}={value}" for name, value in values.items())
+    if "Present_Position" in values:
+        fields.append(f"error_deg={(values['Present_Position'] - rest_position) / STEPS_PER_DEG:+.1f}")
+    print("\nelbow telemetry (raw registers): " + " | ".join(fields), flush=True)
+    for error in errors:
+        print(f"elbow read failed: {error}", flush=True)
+    healthy = not errors and values.get("Torque_Enable") == 1 and values.get("Status") == 0
+    if not healthy:
+        print("Elbow fault, torque loss, or unreadable feedback; stopping and releasing the arm. "
+              "Skipping return-to-rest commands to avoid clearing servo protection.", flush=True)
+    return healthy
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wave hello by flexing the wrist up and down.")
     parser.add_argument("--port", default=None, help="serial port (default: autodetect)")
@@ -137,6 +168,8 @@ def main():
     parser.add_argument("--amplitude", type=float, default=35.0, help="degrees each way (default: 35)")
     parser.add_argument("--period", type=float, default=1.5, help="seconds per full flex (default: 1.5)")
     parser.add_argument("--dry-run", action="store_true", help="show the motion without commanding the arm")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="report elbow telemetry every second; stop on a fault, torque loss, or read failure")
     args = parser.parse_args()
     if math.isnan(args.waves) or not all(math.isfinite(value) for value in (args.amplitude, args.period)):
         parser.error("waves must be a number or inf; amplitude and period must be finite")
@@ -150,6 +183,7 @@ def main():
     center = None
     saved_limits = {}
     wrist_enabled = False
+    elbow_fault = False
     try:
         # Capture once per run, before sending any commands. No fixed home
         # angle or saved pose overrides the position the user starts from.
@@ -209,8 +243,14 @@ def main():
             print("other joints holding their starting positions")
 
         drops = 0
+        next_diagnostic = 0.0
         for offset in wave_offsets(args.waves, amplitude_steps, args.period):
             if not args.dry_run:
+                if args.diagnostics and time.monotonic() >= next_diagnostic:
+                    if not _check_elbow(bus, rest_positions["elbow_flex"]):
+                        elbow_fault = True
+                        break
+                    next_diagnostic = time.monotonic() + DIAGNOSTIC_INTERVAL
                 try:
                     bus.write("Goal_Position", JOINT, round(center + offset),
                               normalize=False, num_retry=WRITE_RETRIES)
@@ -229,7 +269,7 @@ def main():
     finally:
         if not args.dry_run and bus.is_connected:
             # Each step is independent: a failure in one must not skip the rest.
-            if wrist_enabled:
+            if wrist_enabled and not elbow_fault:
                 _safely(_park, bus, rest_positions)
             _safely(_release, bus)
             for joint, limits in saved_limits.items():
