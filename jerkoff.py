@@ -169,7 +169,7 @@ def main():
                         help="up-and-down flexes; inf runs until Ctrl+C (default: inf)")
     parser.add_argument("--amplitude", type=float, default=35.0, help="degrees each way (default: 35)")
     parser.add_argument("--grip-amplitude", type=float, default=3.0,
-                        help="gripper servo degrees each way, within firmware limits; 0 holds still (default: 3)")
+                        help="gripper servo degrees each way; 0 holds still (default: 3)")
     parser.add_argument("--period", type=float, default=1.5, help="seconds per full flex (default: 1.5)")
     parser.add_argument("--dry-run", action="store_true", help="show the motion without commanding the arm")
     parser.add_argument("--diagnostics", action="store_true",
@@ -214,15 +214,15 @@ def main():
             bus.read("Min_Position_Limit", GRIPPER, normalize=False),
             bus.read("Max_Position_Limit", GRIPPER, normalize=False),
         )
-        # Use raw servo angles, not normalized opening percentages. Respect
-        # the gripper's existing travel limits when adding motion.
+        # Compute the requested motion before adjusting firmware limits, just
+        # as for the wrist. Old zero-width limits must not cancel the motion.
         grip_steps = min(
             args.grip_amplitude * STEPS_PER_DEG,
-            max(0, grip_center - max(POS_MIN, grip_limits[0])),
-            max(0, min(POS_MAX, grip_limits[1]) - grip_center),
+            grip_center - POS_MIN,
+            POS_MAX - grip_center,
         ) if amplitude_steps else 0
         if grip_steps < args.grip_amplitude * STEPS_PER_DEG:
-            print("note: trimming gripper motion to fit its limits and wrist motion")
+            print("note: trimming gripper motion to fit the encoder range and wrist motion")
 
         print(f"port {port} | {JOINT} at {center} | flexing +/-{amplitude:.0f} deg")
         print(f"gripper at {grip_center} | opening/closing +/-{grip_steps / STEPS_PER_DEG:.1f} servo deg")
@@ -240,7 +240,7 @@ def main():
                 else:
                     lo = bus.read("Min_Position_Limit", joint, normalize=False)
                     hi = bus.read("Max_Position_Limit", joint, normalize=False)
-                swing = amplitude_steps if joint == JOINT else 0
+                swing = amplitude_steps if joint == JOINT else grip_steps if joint == GRIPPER else 0
                 need_lo = max(POS_MIN, round(position - swing) - MARGIN)
                 need_hi = min(POS_MAX, round(position + swing) + MARGIN)
 
@@ -276,17 +276,21 @@ def main():
                         break
                     next_diagnostic = time.monotonic() + DIAGNOSTIC_INTERVAL
                 try:
+                    commanded_joint = JOINT
                     bus.write("Goal_Position", JOINT, round(center + offset),
                               normalize=False, num_retry=WRITE_RETRIES)
                     if grip_steps:
+                        commanded_joint = GRIPPER
                         bus.write("Goal_Position", GRIPPER, round(grip_center + grip_offset),
                                   normalize=False, num_retry=WRITE_RETRIES)
                     drops = 0
-                except Exception:
+                except Exception as error:
                     # One glitched packet should cost a frame, not the wave.
                     drops += 1
+                    if drops == 1:
+                        print(f"\n{commanded_joint} command failed: {type(error).__name__}: {error}", flush=True)
                     if drops >= MAX_CONSECUTIVE_DROPS:
-                        print("\nbus went quiet, stopping early")
+                        print(f"\n{commanded_joint} commands failing repeatedly, stopping early")
                         break
             print(render(offset / STEPS_PER_DEG, amplitude)
                   + f" | grip {grip_offset / STEPS_PER_DEG:+.1f} servo deg", end="\r", flush=True)

@@ -30,7 +30,6 @@ class FakeBus:
         self.positions = {joint: 2000 + index * 10 for index, joint in enumerate(wave.MOTORS)}
         # Exercise degenerate limits on stationary and moving joints.
         self.limits = {joint: [2046, 2046] for joint in wave.MOTORS}
-        self.limits[wave.GRIPPER] = [0, 4095]
         self.original_limits = {joint: list(limits) for joint, limits in self.limits.items()}
         self.goals = {}
         self.enabled = set()
@@ -176,19 +175,32 @@ class HoldingTests(unittest.TestCase):
                 self.assertEqual(goals, [bus.positions[wave.GRIPPER]] * 2)
                 self.assert_clean(bus)
 
-    def test_gripper_motion_respects_narrow_or_degenerate_limits(self):
-        for headroom in (5, 0):
-            with self.subTest(headroom=headroom):
+    def test_gripper_motion_widens_narrow_degenerate_and_offset_limits(self):
+        for limits in ([2045, 2055], [2050, 2050], [2046, 2046], [0, 4095]):
+            with self.subTest(limits=limits):
                 bus = FakeBus()
                 center = bus.positions[wave.GRIPPER]
-                bus.limits[wave.GRIPPER] = [center - headroom, center + headroom]
+                bus.limits[wave.GRIPPER] = list(limits)
                 bus.original_limits[wave.GRIPPER] = list(bus.limits[wave.GRIPPER])
                 peak = 35 * wave.STEPS_PER_DEG
                 self.run_wave(bus, samples=(peak, -peak, 0))
                 goals = [event[2] for event in bus.events
                          if event[:2] == ("Goal_Position", wave.GRIPPER)]
-                self.assertEqual(min(goals), center - headroom)
-                self.assertEqual(max(goals), center + headroom)
+                self.assertEqual(min(goals), round(center - 3 * wave.STEPS_PER_DEG))
+                self.assertEqual(max(goals), round(center + 3 * wave.STEPS_PER_DEG))
+                self.assert_clean(bus)
+
+    def test_gripper_targets_stay_inside_encoder_range(self):
+        for center in (5, wave.POS_MAX - 5):
+            with self.subTest(center=center):
+                bus = FakeBus()
+                bus.positions[wave.GRIPPER] = center
+                peak = 35 * wave.STEPS_PER_DEG
+                self.run_wave(bus, samples=(peak, -peak, 0))
+                goals = [event[2] for event in bus.events
+                         if event[:2] == ("Goal_Position", wave.GRIPPER)]
+                self.assertEqual(min(goals), center - 5)
+                self.assertEqual(max(goals), center + 5)
                 self.assert_clean(bus)
 
     def test_invalid_grip_amplitude_is_rejected_before_connecting(self):
